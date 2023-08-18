@@ -4,7 +4,7 @@ Clean C language version of running quantized llama2 model
 
 Simple instructions:
 
-## 8bit quantization:
+## 8bit quantization, grouping per layer, without block:
 
 !gcc -O3 -o quantize quantize_8bit.c -lm
 
@@ -16,8 +16,13 @@ Simple instructions:
 
 ./runq llama2_7b_8bit.bin -t {temperature} -p {top_p} -n {max_token} -i "{prompt}"
 
-A quick test, using the Google colab:
-# Runq.c
+## 8bit quantization, grouping by 64 * 64 block:
+
+!gcc -O3 -o quantize quantize_8bit_64block.c -lm
+
+
+
+# A quick test, using the Google colab:
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/elphinkuo/llamaqt.c/blob/master/quantization_8bit_demo.ipynb)
 
