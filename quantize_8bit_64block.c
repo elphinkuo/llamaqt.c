@@ -106,27 +106,6 @@ void get_minmax(float *ptr, int size, float* pmin, float* pmax){
     *pmax = max;
 }
 
-// void quantize_weights(FILE* file, float *weights, int n_layers, int layer_size, char *name) {
-//     puts("------------------------");
-//     printf("%s layer_size=%d\n", name, layer_size);
-//     int block_size = 64;
-//     for (int l = 0; l < n_layers; l++) {
-//         for (int i = 0; i < layer_size; i += block_size * block_size) {
-//             float min, max;
-//             get_minmax(weights + i, block_size * block_size, &min, &max);
-//             float scale = (max - min) / 255;
-//             printf("l=%d block=%d min=%f max=%f scale=%f\n", l, i / (block_size * block_size), min, max, scale);
-//             fwrite(&min, sizeof(float), 1, file);
-//             fwrite(&scale, sizeof(float), 1, file);
-//             for (int j = 0; j < block_size * block_size; j++) {
-//                 uint8_t qweight = round((weights[i + j] - min) / scale);
-//                 fwrite(&qweight, sizeof(uint8_t), 1, file);
-//             }
-//         }
-//         weights += layer_size;
-//     }
-// }
-
 
 void quantize_weights(FILE* file, float *weights, int n_layers, int layer_size, char *name) {
     static const int block_size = 64;
