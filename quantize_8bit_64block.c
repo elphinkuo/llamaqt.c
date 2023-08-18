@@ -1,0 +1,283 @@
+/*
+quantize Llama-2 model to 8 bit in pure C.
+
+Example compile: (see README for more details)
+$ gcc -O3 -o quantize quantize_8bit_64block.c -lm
+
+Then run with:
+$ ./quantize
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <math.h>
+#include <string.h>
+#include <fcntl.h>
+#include <stdint.h>
+#if defined _WIN32
+    #include "win.h"
+#else
+    #include <unistd.h>
+    #include <sys/mman.h>
+#endif
+
+
+// Transformer and RunState structs, and related memory management
+typedef struct {
+    int dim; // transformer dimension
+    int hidden_dim; // for ffn layers
+    int n_layers; // number of layers
+    int n_heads; // number of query heads
+    int n_kv_heads; // number of key/value heads
+    int vocab_size; // vocabulary size, usually 256 (byte-level)
+    int seq_len; // max sequence length
+} Config;
+
+typedef struct {
+    // token embedding table
+    float* token_embedding_table;    // (vocab_size, dim)
+    // weights for rmsnorms
+    float* rms_att_weight; // (layer, dim) rmsnorm weights
+    float* rms_ffn_weight; // (layer, dim)
+    // weights for matmuls. note dim == n_heads * head_sizes
+    float* wq; // (layer, dim, n_heads * head_size)
+    float* wk; // (layer, dim, n_kv_heads * head_size)
+    float* wv; // (layer, dim, n_kv_heads * head_size)
+    float* wo; // (layer, n_heads * head_size, dim)
+    // weights for ffn
+    float* w1; // (layer, hidden_dim, dim)
+    float* w2; // (layer, dim, hidden_dim)
+    float* w3; // (layer, hidden_dim, dim)
+    // final rmsnorm
+    float* rms_final_weight; // (dim,)
+    // freq_cis for RoPE relatively positional embeddings
+    float* freq_cis_real; // (seq_len, dim/2)
+    float* freq_cis_imag; // (seq_len, dim/2)
+    // (optional) classifier weights for the logits, on the last layer
+    float* wcls;
+} TransformerWeights;
+
+// ----------------------------------------------------------------------------
+// initialization: read from checkpoint
+
+void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int shared_weights) {
+    int head_size = p->dim / p->n_heads;
+    float* ptr = f;
+    w->token_embedding_table = ptr;
+    ptr += p->vocab_size * p->dim;
+    w->rms_att_weight = ptr;
+    ptr += p->n_layers * p->dim;
+    w->wq = ptr;
+    ptr += p->n_layers * p->dim * (p->n_heads * head_size);
+    w->wk = ptr;
+    ptr += p->n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wv = ptr;
+    ptr += p->n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wo = ptr;
+    ptr += p->n_layers * (p->n_heads * head_size) * p->dim;
+    w->rms_ffn_weight = ptr;
+    ptr += p->n_layers * p->dim;
+    w->w1 = ptr;
+    ptr += p->n_layers * p->dim * p->hidden_dim;
+    w->w2 = ptr;
+    ptr += p->n_layers * p->hidden_dim * p->dim;
+    w->w3 = ptr;
+    ptr += p->n_layers * p->dim * p->hidden_dim;
+    w->rms_final_weight = ptr;
+    ptr += p->dim;
+    w->freq_cis_real = ptr;
+    ptr += p->seq_len * head_size / 2;
+    w->freq_cis_imag = ptr;
+    ptr += p->seq_len * head_size / 2;
+    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+}
+
+void get_minmax(float *ptr, int size, float* pmin, float* pmax){
+    float min = INFINITY;
+    float max = -INFINITY;
+
+    for (int i = 0; i < size; i++){
+        if (ptr[i] < min) min = ptr[i];
+        if (ptr[i] > max) max = ptr[i];
+    }
+
+    *pmin = min;
+    *pmax = max;
+}
+
+// void quantize_weights(FILE* file, float *weights, int n_layers, int layer_size, char *name) {
+//     puts("------------------------");
+//     printf("%s layer_size=%d\n", name, layer_size);
+//     int block_size = 64;
+//     for (int l = 0; l < n_layers; l++) {
+//         for (int i = 0; i < layer_size; i += block_size * block_size) {
+//             float min, max;
+//             get_minmax(weights + i, block_size * block_size, &min, &max);
+//             float scale = (max - min) / 255;
+//             printf("l=%d block=%d min=%f max=%f scale=%f\n", l, i / (block_size * block_size), min, max, scale);
+//             fwrite(&min, sizeof(float), 1, file);
+//             fwrite(&scale, sizeof(float), 1, file);
+//             for (int j = 0; j < block_size * block_size; j++) {
+//                 uint8_t qweight = round((weights[i + j] - min) / scale);
+//                 fwrite(&qweight, sizeof(uint8_t), 1, file);
+//             }
+//         }
+//         weights += layer_size;
+//     }
+// }
+
+
+void quantize_weights(FILE* file, float *weights, int n_layers, int layer_size, char *name) {
+    static const int block_size = 64;
+    int blocks_per_layer = layer_size / (block_size * block_size);
+    
+    printf("%s layer_size=%d\n", name, layer_size);
+    
+    for (int l = 0; l < n_layers; l++) {
+        for (int b = 0; b < blocks_per_layer; b++) {
+            float* block_start = weights + l * layer_size + b * block_size * block_size;
+
+            float min, max;
+            get_minmax(block_start, block_size * block_size, &min, &max);
+            float scale = (max - min) / 255;
+            
+            // Possibly replace these prints with some debug-logging macro if needed
+            printf("l=%d block=%d min=%f max=%f scale=%f\n", l, b, min, max, scale);
+            
+            fwrite(&min, sizeof(float), 1, file);
+            fwrite(&scale, sizeof(float), 1, file);
+
+            uint8_t qweights[block_size * block_size];
+
+            for (int j = 0; j < block_size * block_size; j++) {
+                qweights[j] = round((block_start[j] - min) / scale);
+            }
+
+            fwrite(qweights, sizeof(uint8_t), block_size * block_size, file);
+        }
+    }
+}
+
+
+
+
+void write_weights(FILE* file, float *weights, int n_layers, int layer_size, char *name) {
+    puts("------------------------");
+    printf("%s layer_size=%d\n", name, layer_size);
+    printf("%d layer(s) - not quantized\n", n_layers);
+    fwrite(weights, sizeof(float), n_layers * layer_size, file);
+}
+
+int convert_weights_q8(TransformerWeights *w, Config *p, int shared_weights){
+
+    FILE* file = fopen("llama2_7b_8bit_block.bin", "wb");
+    if (file == NULL) {
+        perror("Error opening file");
+        return 1;
+    }
+
+    int vocab_size = p->vocab_size;
+    if (!shared_weights) {
+        vocab_size = -vocab_size;
+    }
+
+    // write headers
+    fwrite(&p->dim, sizeof(int), 1, file);
+    fwrite(&p->hidden_dim, sizeof(int), 1, file);
+    fwrite(&p->n_layers, sizeof(int), 1, file);
+    fwrite(&p->n_heads, sizeof(int), 1, file);
+    fwrite(&p->n_kv_heads, sizeof(int), 1, file);
+    fwrite(&vocab_size, sizeof(int), 1, file);
+    fwrite(&p->seq_len, sizeof(int), 1, file);
+
+    // write quantized weights
+    int head_size = p->dim / p->n_heads;
+
+    quantize_weights(file, w->token_embedding_table, 1, p->vocab_size * p->dim, "token_embedding_table");
+
+    quantize_weights(file, w->rms_att_weight, p->n_layers, p->dim, "rms_att_weight");
+
+    quantize_weights(file, w->wq, p->n_layers, p->dim * (p->n_heads * head_size), "wq");
+    quantize_weights(file, w->wk, p->n_layers, p->dim * (p->n_kv_heads * head_size), "wk");
+    quantize_weights(file, w->wv, p->n_layers, p->dim * (p->n_kv_heads * head_size), "wv");
+    quantize_weights(file, w->wo, p->n_layers, (p->n_heads * head_size) * p->dim, "wo");
+
+    quantize_weights(file, w->rms_ffn_weight, p->n_layers, p->dim, "rms_ffn_weight");
+    
+    quantize_weights(file, w->w1, p->n_layers, p->dim * p->hidden_dim, "w1");
+    quantize_weights(file, w->w2, p->n_layers, p->hidden_dim * p->dim, "w2");
+    quantize_weights(file, w->w3, p->n_layers, p->dim * p->hidden_dim, "w3");
+
+    quantize_weights(file, w->rms_final_weight, 1, p->dim, "rms_final_weight");
+
+    write_weights(file, w->freq_cis_real, 1, p->seq_len * head_size / 2, "freq_cis_real");
+    write_weights(file, w->freq_cis_imag, 1, p->seq_len * head_size / 2, "freq_cis_imag");
+
+    if (!shared_weights) {
+        quantize_weights(file, w->wcls, 1, p->vocab_size * p->dim, "wcls");
+    }
+
+    puts("------------------------");
+
+    fclose(file);
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+
+    // poor man's C argparse
+    char *checkpoint = NULL;  // e.g. out/model.bin
+
+    // 'checkpoint' is necessary arg
+    if (argc < 2) {
+        printf("Usage: %s <checkpoint_file>\n", argv[0]);
+        return 1;
+    }
+    if (argc >= 2) {
+        checkpoint = argv[1];
+    }
+    
+    // read in the model.bin file
+    Config config;
+    TransformerWeights weights;
+    int fd = 0;         // file descriptor for memory mapping
+    float* data = NULL; // memory mapped data pointer
+    long file_size;     // size of the checkpoint file in bytes
+    {
+        FILE *file = fopen(checkpoint, "rb");
+        if (!file) { printf("Couldn't open file %s\n", checkpoint); return 1; }
+
+        // read in the config header
+        if (fread(&config, sizeof(Config), 1, file) != 1) { return 1; }
+        // negative vocab size is hacky way of signaling unshared weights. bit yikes.
+        int shared_weights = config.vocab_size > 0 ? 1 : 0;
+        config.vocab_size = abs(config.vocab_size);
+        printf("vocab size = %d  shared_weights = %s\n", config.vocab_size, shared_weights ? "yes" : "no");
+
+        // figure out the file size
+        fseek(file, 0, SEEK_END); // move file pointer to end of file
+        file_size = ftell(file); // get the file size, in bytes
+        fclose(file);
+        printf("Model file size = %ldMB\n", file_size/1024/1024);
+
+        // // memory map the Transformer weights into the data pointer
+        fd = open(checkpoint, O_RDONLY); // open in read only mode
+        if (fd == -1) { printf("open failed!\n"); return 1; }
+        data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (data == MAP_FAILED) { printf("mmap failed!\n"); return 1; }
+        
+        // fast-forward to weight data, skipping metadata
+        float* weights_ptr = data + sizeof(Config)/sizeof(float);
+        
+        checkpoint_init_weights(&weights, &config, weights_ptr, shared_weights);
+
+        int ret = convert_weights_q8(&weights, &config, shared_weights);
+        if (ret == 0) printf("model converted and saved to llama2_7b_8bit_block.bin\n");
+    }
+    
+    // memory and file handles cleanup
+    if (data != MAP_FAILED) munmap(data, file_size);
+    if (fd != -1) close(fd);
+    return 0;
+}
