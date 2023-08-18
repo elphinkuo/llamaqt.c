@@ -14,7 +14,7 @@ runq: runq.c
 
 # runq with -O0, i.e. no optimizations, run 8 bit quantization
 .PHONY: quantize
-runq: quantize_8bit.c
+quantize: quantize_8bit.c
 	$(CC) -O3 -o quantize quantize_8bit.c -lm
 
 # run_64block with -O0, i.e. no optimizations, run 8 bit quantization
