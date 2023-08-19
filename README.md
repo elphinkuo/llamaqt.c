@@ -6,19 +6,19 @@ Simple instructions:
 
 ## 8bit quantization, grouping per layer, without block:
 
-!gcc -O3 -o quantize quantize_8bit.c -lm
+gcc -O3 -o quantize quantize_8bit.c -lm
 
 ./quantize {model_name}.bin
 
 ## Inference 8bit quantization
 
-!gcc -O3 -march=native runq.c -o runq -lm
+gcc -O3 -march=native runq.c -o runq -lm
 
 ./runq llama2_7b_8bit.bin -t {temperature} -p {top_p} -n {max_token} -i "{prompt}"
 
 ## 8bit quantization, grouping by 64 * 64 block:
 
-!gcc -O3 -o quantize quantize_8bit_64block.c -lm
+gcc -O3 -o quantize quantize_8bit_64block.c -lm
 
 
 
