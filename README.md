@@ -1,5 +1,5 @@
 # llama2qt.c
-Clean C language version of running quantized llama2 model
+Clean C language version of quantizing llama2 model and running quantized llama2 model
 
 
 Simple instructions:
