@@ -1,6 +1,6 @@
 # llama2qt.c
-Clean C language version of quantizing llama2 model and running quantized llama2 model
-
+Clean C language version of quantizing llama2 model and running quantized llama2 model.
+The code contains some modifications (mainly about quantization and running quantized model) based on [llama.c](https://github.com/karpathy/llama2.c) (Inference Llama 2 in one file of pure C) from  Andrej Karpathy.
 
 Simple instructions:
 
